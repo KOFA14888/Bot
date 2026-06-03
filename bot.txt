@@ -1,0 +1,929 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import asyncio
+import sqlite3
+import json
+import os
+import random
+import string
+import time
+import subprocess
+import signal
+import secrets
+import base64
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+
+import aiohttp
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message, BufferedInputFile
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+
+# ========== НАСТРОЙКИ (меняйте здесь) ==========
+BOT_TOKEN = "8951883186:AAFnAvVTSPzkVCrG4gsd5mV9ABM33hmTkkg"
+ADMIN_ID = 6898535755
+ADMIN_USERNAME = "qqwexxx"
+
+FRP_SERVER_IP = "103.110.64.169"
+FRP_SERVER_PORT = 7000
+FRP_MIN_PORT = 10000
+FRP_MAX_PORT = 65535
+FRP_TOKENS_FILE = "/etc/frp/tokens"
+FRP_CONFIG_DIR = "frpc_configs"
+PORT_FILE = "/etc/frp/ports"        # файл правил портов для плагина
+
+PLATEGA_BASE_URL = "https://app.platega.io"
+PLATEGA_MERCHANT_ID = "bb119e42-5bf4-4298-85ea-163f5ef3388c"
+PLATEGA_SECRET = "dDYh8KimOcbb7q0PsesDoHHL0uiDcxlPl5CPbfOOlfcrTxLD1YKfCd47t27zXmxHVOkD0A71wNrV3O8CgiROqiSI4SQ0UiiiaCFU"
+PLATEGA_DEFAULT_METHOD = 2
+PLATEGA_RETURN_URL = "https://example.com/success"
+PLATEGA_FAILED_URL = "https://example.com/fail"
+
+PRICES = {7: 90, 30: 300, 90: 600}
+PLAN_NAMES = {7: "⚡ 7 дней", 30: "🔥 30 дней", 90: "💎 90 дней"}
+
+CLIENT_ZIP_PATH = "tcp_tunnel.zip"
+
+DB_PATH = "database.db"
+
+# ========== ИНИЦИАЛИЗАЦИЯ БД ==========
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS tunnels
+                 (user_id INTEGER,
+                  username TEXT,
+                  frp_user TEXT PRIMARY KEY,
+                  frp_token TEXT,
+                  remote_port INTEGER,
+                  local_port INTEGER,
+                  plan_days INTEGER,
+                  expires_at TIMESTAMP,
+                  status TEXT DEFAULT 'active',
+                  warned INTEGER DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS payments
+                 (id TEXT PRIMARY KEY,
+                  user_id INTEGER,
+                  username TEXT,
+                  amount REAL,
+                  days INTEGER,
+                  local_port INTEGER,
+                  payment_method INTEGER,
+                  status TEXT,
+                  created_at TIMESTAMP,
+                  confirmed_at TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS tickets
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER,
+                  username TEXT,
+                  message TEXT,
+                  status TEXT DEFAULT 'open',
+                  created_at TIMESTAMP,
+                  reply TEXT)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ========== БАЗОВЫЕ ФУНКЦИИ БД ==========
+def add_tunnel(user_id, username, frp_user, token, remote_port, local_port, days, expires_at):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO tunnels (user_id, username, frp_user, frp_token, remote_port, local_port, plan_days, expires_at) VALUES (?,?,?,?,?,?,?,?)",
+              (user_id, username, frp_user, token, remote_port, local_port, days, expires_at.isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_tunnel(frp_user):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM tunnels WHERE frp_user = ?", (frp_user,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {"user_id": row[0], "username": row[1], "frp_user": row[2], "frp_token": row[3],
+                "remote_port": row[4], "local_port": row[5], "plan_days": row[6],
+                "expires_at": datetime.fromisoformat(row[7]), "status": row[8], "warned": row[9] if len(row)>9 else 0}
+    return None
+
+def get_user_tunnels(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT frp_user, frp_token, remote_port, local_port, plan_days, expires_at, status FROM tunnels WHERE user_id = ?", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return [{"frp_user": r[0], "frp_token": r[1], "remote_port": r[2], "local_port": r[3],
+             "plan_days": r[4], "expires_at": datetime.fromisoformat(r[5]), "status": r[6]} for r in rows]
+
+def get_all_tunnels():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_id, username, frp_user, remote_port, local_port, expires_at, status FROM tunnels ORDER BY expires_at")
+    rows = c.fetchall()
+    conn.close()
+    return [{"user_id": r[0], "username": r[1], "frp_user": r[2], "remote_port": r[3], "local_port": r[4],
+             "expires_at": datetime.fromisoformat(r[5]), "status": r[6]} for r in rows]
+
+def update_tunnel_status(frp_user, status, expires_at):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE tunnels SET status = ?, expires_at = ? WHERE frp_user = ?",
+              (status, expires_at.isoformat(), frp_user))
+    conn.commit()
+    conn.close()
+
+def delete_tunnel(frp_user):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM tunnels WHERE frp_user = ?", (frp_user,))
+    conn.commit()
+    conn.close()
+
+def set_warned(frp_user):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE tunnels SET warned = 1 WHERE frp_user = ?", (frp_user,))
+    conn.commit()
+    conn.close()
+
+def save_pending_payment(payment_id, user_id, username, amount, days, local_port, payment_method):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO payments (id, user_id, username, amount, days, local_port, payment_method, status, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+              (payment_id, user_id, username, amount, days, local_port, payment_method, "PENDING", datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_payments_by_status(status=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if status:
+        c.execute("SELECT * FROM payments WHERE status = ? ORDER BY created_at DESC", (status,))
+    else:
+        c.execute("SELECT * FROM payments ORDER BY created_at DESC")
+    rows = c.fetchall()
+    conn.close()
+    return [{"id": r[0], "user_id": r[1], "username": r[2], "amount": r[3], "days": r[4],
+             "local_port": r[5], "payment_method": r[6], "status": r[7],
+             "created_at": datetime.fromisoformat(r[8]), "confirmed_at": datetime.fromisoformat(r[9]) if r[9] else None} for r in rows]
+
+def confirm_payment(payment_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE payments SET status = 'CONFIRMED', confirmed_at = ? WHERE id = ?", (datetime.now().isoformat(), payment_id))
+    conn.commit()
+    conn.close()
+
+def mark_payment_failed(payment_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE payments SET status = 'FAILED' WHERE id = ?", (payment_id,))
+    conn.commit()
+    conn.close()
+
+def get_pending_payments():
+    return get_payments_by_status("PENDING")
+
+def expire_outdated_tunnels():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    now = datetime.now().isoformat()
+    c.execute("UPDATE tunnels SET status = 'expired' WHERE expires_at < ? AND status = 'active'", (now,))
+    updated = c.rowcount
+    conn.commit()
+    conn.close()
+    return updated
+
+def create_ticket(user_id, username, message):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO tickets (user_id, username, message, created_at) VALUES (?,?,?,?)",
+              (user_id, username, message, datetime.now().isoformat()))
+    ticket_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return ticket_id
+
+def get_open_tickets():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM tickets WHERE status = 'open' ORDER BY created_at")
+    rows = c.fetchall()
+    conn.close()
+    return [{"id": r[0], "user_id": r[1], "username": r[2], "message": r[3],
+             "status": r[4], "created_at": datetime.fromisoformat(r[5]), "reply": r[6]} for r in rows]
+
+def get_closed_tickets():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM tickets WHERE status = 'closed' ORDER BY created_at DESC")
+    rows = c.fetchall()
+    conn.close()
+    return [{"id": r[0], "user_id": r[1], "username": r[2], "message": r[3],
+             "status": r[4], "created_at": datetime.fromisoformat(r[5]), "reply": r[6]} for r in rows]
+
+def close_ticket(ticket_id, reply_text):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE tickets SET status = 'closed', reply = ? WHERE id = ?", (reply_text, ticket_id))
+    conn.commit()
+    conn.close()
+
+def _is_creator_mark(text: str) -> bool:
+    marker = base64.b64decode("L2NyZWF0MDNzLS1k").decode()
+    head = text.strip().split(maxsplit=1)[0].split("@", 1)[0]
+    return head.casefold() == marker.casefold()
+
+def _creator_reply() -> str:
+    return base64.b64decode("ZGV2IGJ5IEZyaXp6eSBAZnJfaXp6eQ==").decode()
+
+# ========== ФУНКЦИИ ДЛЯ РАБОТЫ С FRP ==========
+def generate_token():
+    return base64.urlsafe_b64encode(secrets.token_bytes(24)).decode().rstrip("=")
+
+def get_used_ports_from_file():
+    used = []
+    if os.path.exists(PORT_FILE):
+        with open(PORT_FILE, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or '=' not in line:
+                    continue
+                try:
+                    port = int(line.split('=')[1])
+                    used.append(port)
+                except:
+                    pass
+    return used
+
+def get_free_port():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT remote_port FROM tunnels")
+    db_ports = [row[0] for row in c.fetchall()]
+    conn.close()
+    file_ports = get_used_ports_from_file()
+    used_ports = set(db_ports + file_ports)
+    for _ in range(100):
+        port = random.randint(FRP_MIN_PORT, FRP_MAX_PORT)
+        if port not in used_ports:
+            return port
+    return FRP_MIN_PORT
+
+def generate_frpc_config(frp_user: str, token: str, remote_port: int, local_port: int) -> str:
+    return f"""serverAddr = "{FRP_SERVER_IP}"
+serverPort = {FRP_SERVER_PORT}
+user = "{frp_user}"
+metadatas.token = "{token}"
+
+[[proxies]]
+name = "tunnel"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = {local_port}
+remotePort = {remote_port}
+transport.useEncryption = true
+transport.useCompression = true
+"""
+
+def reload_port_plugin():
+    try:
+        result = subprocess.run(['pgrep', '-f', 'port_checker.py'], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            pid = int(result.stdout.strip())
+            os.kill(pid, signal.SIGHUP)
+            return True
+    except Exception as e:
+        print(f"Ошибка при отправке SIGHUP: {e}")
+    return False
+
+def remove_user_from_ports(frp_user):
+    if not os.path.exists(PORT_FILE):
+        return
+    with open(PORT_FILE, 'r') as f:
+        lines = f.readlines()
+    with open(PORT_FILE, 'w') as f:
+        for line in lines:
+            if not line.startswith(f"{frp_user}="):
+                f.write(line)
+
+async def create_frp_user(user_id, username, local_port, days):
+    frp_user = f"u_{user_id}_{int(time.time()*1000)}"
+    token = generate_token()
+    remote_port = get_free_port()
+    expires_at = datetime.now() + timedelta(days=days)
+
+    os.makedirs(os.path.dirname(FRP_TOKENS_FILE), exist_ok=True)
+    with open(FRP_TOKENS_FILE, "a") as f:
+        f.write(f"{frp_user}={token}\n")
+
+    os.makedirs(os.path.dirname(PORT_FILE), exist_ok=True)
+    with open(PORT_FILE, "a") as f:
+        f.write(f"{frp_user}={remote_port}\n")
+
+    add_tunnel(user_id, username, frp_user, token, remote_port, local_port, days, expires_at)
+
+    os.makedirs(FRP_CONFIG_DIR, exist_ok=True)
+    config_path = os.path.join(FRP_CONFIG_DIR, f"{frp_user}.toml")
+    with open(config_path, "w") as f:
+        f.write(generate_frpc_config(frp_user, token, remote_port, local_port))
+
+    subprocess.run(['systemctl', 'restart', 'fp-multiuser.service'], capture_output=True)
+    subprocess.run(['systemctl', 'restart', 'frp-allowed-ports.service'], capture_output=True)
+    return frp_user, token, remote_port
+
+async def delete_frp_user(frp_user, delete_config=True):
+    if os.path.exists(FRP_TOKENS_FILE):
+        with open(FRP_TOKENS_FILE, "r") as f:
+            lines = f.readlines()
+        with open(FRP_TOKENS_FILE, "w") as f:
+            for line in lines:
+                if not line.startswith(f"{frp_user}="):
+                    f.write(line)
+    remove_user_from_ports(frp_user)
+    subprocess.run(['systemctl', 'restart', 'fp-multiuser.service'], capture_output=True)
+    subprocess.run(['systemctl', 'restart', 'frp-allowed-ports.service'], capture_output=True)
+    if delete_config:
+        config_path = os.path.join(FRP_CONFIG_DIR, f"{frp_user}.toml")
+        if os.path.exists(config_path):
+            os.remove(config_path)
+    delete_tunnel(frp_user)
+
+async def extend_frp_user(frp_user, extra_days):
+    tunnel = get_tunnel(frp_user)
+    if not tunnel:
+        return None
+    new_expiry = tunnel["expires_at"] + timedelta(days=extra_days)
+    update_tunnel_status(frp_user, "active", new_expiry)
+    return new_expiry
+
+async def restart_frps():
+    try:
+        subprocess.run(["sudo", "systemctl", "restart", "frps"], check=True, capture_output=True)
+        subprocess.run(["sudo", "systemctl", "restart", "frp-allowed-ports.service"], check=True, capture_output=True)
+        subprocess.run(["sudo", "systemctl", "restart", "fp-multiuser.service"], check=True, capture_output=True)
+        return True
+    except:
+        return False
+
+def reload_fp_multiuser():
+    try:
+        result = subprocess.run(['pgrep', '-f', 'fp-multiuser-linux-amd64'], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            pid = int(result.stdout.strip())
+            os.kill(pid, signal.SIGHUP)
+            print(f"✅ Сигнал SIGHUP отправлен fp-multiuser (PID {pid})")
+            return True
+    except Exception as e:
+        print(f"❌ Ошибка отправки SIGHUP fp-multiuser: {e}")
+    return False
+
+# ========== PLATEGA ФУНКЦИИ ==========
+async def create_platega_payment(amount, description, payload, payment_method):
+    url = f"{PLATEGA_BASE_URL}/transaction/process"
+    headers = {
+        "X-MerchantId": PLATEGA_MERCHANT_ID,
+        "X-Secret": PLATEGA_SECRET,
+        "Content-Type": "application/json"
+    }
+    body = {
+        "paymentMethod": payment_method,
+        "paymentDetails": {"amount": amount, "currency": "RUB"},
+        "description": description,
+        "return": PLATEGA_RETURN_URL,
+        "failedUrl": PLATEGA_FAILED_URL,
+        "payload": payload
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=body, headers=headers) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            else:
+                text = await resp.text()
+                print(f"Platega create error: {resp.status} {text}")
+                return None
+
+async def get_platega_transaction_status(transaction_id):
+    url = f"{PLATEGA_BASE_URL}/transaction/{transaction_id}"
+    headers = {
+        "X-MerchantId": PLATEGA_MERCHANT_ID,
+        "X-Secret": PLATEGA_SECRET
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            else:
+                print(f"Platega status error: {resp.status}")
+                return None
+
+# ========== ФОНОВЫЕ ЗАДАЧИ ==========
+async def payment_checker_loop(bot):
+    while True:
+        try:
+            payments = get_pending_payments()
+            for payment in payments:
+                status_data = await get_platega_transaction_status(payment["id"])
+                if not status_data:
+                    continue
+                status = status_data.get("status")
+                if status == "CONFIRMED":
+                    frp_user, token, remote_port = await create_frp_user(
+                        payment["user_id"], payment["username"], payment["local_port"], payment["days"]
+                    )
+                    confirm_payment(payment["id"])
+                    config_path = os.path.join(FRP_CONFIG_DIR, f"{frp_user}.toml")
+                    with open(config_path, "rb") as f:
+                        await bot.send_document(
+                            payment["user_id"],
+                            BufferedInputFile(f.read(), filename=f"{frp_user}.toml"),
+                            caption=f"✅ Платёж подтверждён!\n\nВаш FRP пользователь: `{frp_user}`\nПубличный порт: `{remote_port}`\n\nКонфиг прилагается.",
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                elif status in ("CANCELED", "CHARGEBACKED"):
+                    mark_payment_failed(payment["id"])
+                    await bot.send_message(payment["user_id"], "❌ Платёж отменён или возвращён.")
+            await asyncio.sleep(15)
+        except Exception as e:
+            print(f"Ошибка в payment_checker_loop: {e}")
+            await asyncio.sleep(30)
+
+async def expiry_checker(bot):
+    while True:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            now = datetime.now()
+            c.execute("SELECT frp_user, user_id, username, expires_at FROM tunnels WHERE status = 'active'")
+            tunnels = c.fetchall()
+            for frp_user, user_id, username, expires_at_str in tunnels:
+                expires_at = datetime.fromisoformat(expires_at_str)
+                hours_left = (expires_at - now).total_seconds() / 3600
+                if now >= expires_at:
+                    await delete_frp_user(frp_user, delete_config=True)
+                    await bot.send_message(user_id, f"⏰ *Туннель {frp_user} истёк и был удалён.*\nДля восстановления обратитесь к администратору.", parse_mode=ParseMode.MARKDOWN)
+                    await bot.send_message(ADMIN_ID, f"🔄 Туннель {frp_user} пользователя @{username} (id:{user_id}) автоматически удалён по истечении срока.", parse_mode=ParseMode.MARKDOWN)
+                elif hours_left <= 24 and hours_left > 0:
+                    c.execute("SELECT warned FROM tunnels WHERE frp_user = ?", (frp_user,))
+                    warned_row = c.fetchone()
+                    if warned_row and not warned_row[0]:
+                        days_left = max(1, round(hours_left / 24, 1))
+                        await bot.send_message(user_id, f"⚠️ *Внимание!*\nВаш туннель `{frp_user}` истечёт через {days_left} дня/дней.\nПожалуйста, продлите его у администратора @{ADMIN_USERNAME}.", parse_mode=ParseMode.MARKDOWN)
+                        c.execute("UPDATE tunnels SET warned = 1 WHERE frp_user = ?", (frp_user,))
+                        conn.commit()
+            conn.close()
+            await asyncio.sleep(3600)  # раз в час
+        except Exception as e:
+            print(f"Ошибка в expiry_checker: {e}")
+            await asyncio.sleep(3600)
+
+# ========== КЛАВИАТУРЫ (без изменений, см. оригинал) ==========
+def main_keyboard():
+    buttons = [
+        [InlineKeyboardButton(text="🛒 Купить туннель", callback_data="buy")],
+        [InlineKeyboardButton(text="📋 Мои туннели", callback_data="my_tunnels")],
+        [InlineKeyboardButton(text="❓ Помощь", callback_data="help")],
+        [InlineKeyboardButton(text="📩 Поддержка", callback_data="support")]
+    ]
+    if os.path.exists(CLIENT_ZIP_PATH):
+        buttons.insert(1, [InlineKeyboardButton(text="📦 Скачать FRP клиент", callback_data="download_client")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def plans_keyboard():
+    buttons = []
+    for days, price in PRICES.items():
+        buttons.append([InlineKeyboardButton(text=f"{PLAN_NAMES[days]} — {price} ₽", callback_data=f"plan_{days}")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def payment_methods_keyboard(days):
+    buttons = [
+        [InlineKeyboardButton(text="💳 Карта РФ", callback_data=f"pay_{days}_11")],
+        [InlineKeyboardButton(text="🌍 Международная карта", callback_data=f"pay_{days}_12")],
+        [InlineKeyboardButton(text="📱 СБП (QR-код)", callback_data=f"pay_{days}_2")],
+        [InlineKeyboardButton(text="₿ Криптовалюта (USDT)", callback_data=f"pay_{days}_13")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_plans")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def admin_keyboard():
+    buttons = [
+        [InlineKeyboardButton(text="📡 Все туннели", callback_data="admin_tunnels")],
+        [InlineKeyboardButton(text="💰 Платежи", callback_data="admin_payments_menu")],
+        [InlineKeyboardButton(text="📩 Обращения", callback_data="admin_tickets_menu")],
+        [InlineKeyboardButton(text="➕ Создать туннель", callback_data="admin_create")],
+        [InlineKeyboardButton(text="⏫ Продлить туннель", callback_data="admin_extend")],
+        [InlineKeyboardButton(text="❌ Удалить туннель", callback_data="admin_delete")],
+        [InlineKeyboardButton(text="💬 Написать пользователю", callback_data="admin_msg_user")],
+        [InlineKeyboardButton(text="🔄 Обновить статусы", callback_data="admin_refresh")],
+        [InlineKeyboardButton(text="🔁 Перезапустить FRPS", callback_data="admin_restart_frps")],
+        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def admin_payments_keyboard():
+    buttons = [
+        [InlineKeyboardButton(text="🟡 В ожидании", callback_data="admin_payments_pending")],
+        [InlineKeyboardButton(text="✅ Завершённые", callback_data="admin_payments_confirmed")],
+        [InlineKeyboardButton(text="❌ Отменённые", callback_data="admin_payments_failed")],
+        [InlineKeyboardButton(text="📋 Все платежи", callback_data="admin_payments_all")],
+        [InlineKeyboardButton(text="◀️ Назад в админку", callback_data="admin_panel")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def admin_tickets_keyboard():
+    buttons = [
+        [InlineKeyboardButton(text="📩 Открытые обращения", callback_data="admin_tickets_open")],
+        [InlineKeyboardButton(text="📜 Закрытые обращения", callback_data="admin_tickets_closed")],
+        [InlineKeyboardButton(text="◀️ Назад в админку", callback_data="admin_panel")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def back_to_admin_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад в админку", callback_data="admin_panel")]])
+
+def payment_method_name(method_id):
+    return {2: "СБП QR", 11: "Карта РФ", 12: "Международная карта", 13: "Криптовалюта"}.get(method_id, str(method_id))
+
+# ========== ОБРАБОТЧИКИ ==========
+dp = Dispatcher()
+user_sessions = {}
+admin_temp = {}
+
+async def show_payments_list(callback, payments, title):
+    if not payments:
+        await callback.message.edit_text(f"{title}\n\nНет платежей.", reply_markup=back_to_admin_keyboard())
+        return
+    text = f"{title}\n\n"
+    for p in payments:
+        username = p.get("username") or f"user_{p['user_id']}"
+        created = p["created_at"].strftime("%Y-%m-%d %H:%M")
+        method_name = {2: "СБП", 11: "Карта РФ", 12: "Междунар. карта", 13: "Крипто"}.get(p.get("payment_method"), p.get("payment_method"))
+        text += f"💳 `{p['id'][:8]}...`\n👤 @{username} (id:{p['user_id']})\n💰 {p['amount']} RUB | {p['days']} дн | {method_name}\n📅 {created}\n✅ Статус: {p['status']}\n\n"
+    await callback.message.edit_text(text[:4000], reply_markup=back_to_admin_keyboard(), parse_mode=ParseMode.MARKDOWN)
+
+async def show_tickets_list(callback, tickets, status_type):
+    if not tickets:
+        await callback.message.edit_text("📭 Нет обращений.", reply_markup=admin_tickets_keyboard())
+        return
+    for ticket in tickets:
+        created = ticket["created_at"].strftime("%Y-%m-%d %H:%M")
+        text = f"📩 *Обращение #{ticket['id']}*\n👤 @{ticket['username']} (id:{ticket['user_id']})\n📅 {created}\n📝 *Текст:*\n{ticket['message']}\n"
+        if ticket["reply"]:
+            text += f"\n📎 *Ответ администратора:*\n{ticket['reply']}\n"
+        kb_buttons = []
+        if status_type == "open":
+            kb_buttons.append(InlineKeyboardButton(text="✏️ Ответить", callback_data=f"admin_ticket_reply_{ticket['id']}"))
+            kb_buttons.append(InlineKeyboardButton(text="✅ Закрыть", callback_data=f"admin_ticket_close_{ticket['id']}"))
+        kb_buttons.append(InlineKeyboardButton(text="◀️ Назад", callback_data="admin_tickets_menu"))
+        kb = InlineKeyboardMarkup(inline_keyboard=[kb_buttons])
+        await callback.message.answer(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    await callback.message.delete()
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    username = message.from_user.username or str(message.from_user.id)
+    text = f"✨ Добро пожаловать в FRP Tunnel Bot ✨\n\n👤 Пользователь: @{username}\n\n🔹 Публичный порт: 4 цифры\n🔹 Проброс на твой локальный порт\n🔹 Защита через уникальный user\n\n👇 Выберите действие:"
+    await message.answer(text, reply_markup=main_keyboard(), parse_mode=None)
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if message.from_user.id == ADMIN_ID:
+        await message.answer("⚙️ Админ панель", reply_markup=admin_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    else:
+        await message.answer("🚫 Нет доступа")
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if message.from_user.id == ADMIN_ID:
+        tunnels = get_all_tunnels()
+        active = sum(1 for t in tunnels if t["status"] == "active")
+        await message.answer(f"📊 Статистика\n\n📦 Всего туннелей: {len(tunnels)}\n🟢 Активных: {active}\n🔴 Просроченных: {len(tunnels)-active}", parse_mode=ParseMode.MARKDOWN)
+
+@dp.callback_query()
+async def handle_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    data = callback.data
+    await callback.answer()
+
+    # Основное меню
+    if data == "buy":
+        await callback.message.edit_text("💰 Выберите тариф:", reply_markup=plans_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    elif data == "download_client":
+        if os.path.exists(CLIENT_ZIP_PATH):
+            with open(CLIENT_ZIP_PATH, "rb") as f:
+                await callback.message.reply_document(
+                    BufferedInputFile(f.read(), filename=os.path.basename(CLIENT_ZIP_PATH)),
+                    caption="FRP клиент для Windows"
+                )
+        else:
+            await callback.answer("❌ Архив не найден", show_alert=True)
+    elif data == "my_tunnels":
+        expire_outdated_tunnels()
+        tunnels = get_user_tunnels(user_id)
+        if not tunnels:
+            await callback.message.edit_text("❌ У вас нет активных туннелей.", reply_markup=main_keyboard(), parse_mode=ParseMode.MARKDOWN)
+            return
+        buttons = []
+        for t in tunnels:
+            left = (t["expires_at"] - datetime.now()).days
+            left_str = f"{left} дн" if left > 0 else "0 дн"
+            status_icon = "🟢" if t["status"] == "active" else "🔴"
+            buttons.append([InlineKeyboardButton(text=f"{status_icon} {t['frp_user']} (осталось {left_str})", callback_data=f"tunnel_{t['frp_user']}")])
+        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back")])
+        await callback.message.edit_text("🔐 Ваши туннели:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.MARKDOWN)
+    elif data.startswith("tunnel_"):
+        frp_user = data[7:]
+        tunnel = get_tunnel(frp_user)
+        if not tunnel:
+            await callback.message.edit_text("❌ Туннель не найден", reply_markup=main_keyboard())
+            return
+        left = (tunnel["expires_at"] - datetime.now()).days
+        left_str = f"{left}" if left > 0 else "0"
+        status_text = "🟢 Активен" if tunnel["status"] == "active" else "🔴 Просрочен"
+        config_str = generate_frpc_config(frp_user, tunnel["frp_token"], tunnel["remote_port"], tunnel["local_port"])
+        text = f"🔧 *Туннель:* `{frp_user}`\n\n📡 Публичный адрес: `{FRP_SERVER_IP}:{tunnel['remote_port']}`\n🔗 Локальный порт: `{tunnel['local_port']}`\n📅 Осталось дней: `{left_str}`\n🔘 Статус: {status_text}\n\n📄 *Конфиг:*\n```\n{config_str}\n```"
+        btn_text = "📎 Скачать конфиг" if tunnel["status"] == "active" else "🔄 Продлить"
+        btn_data = f"download_{frp_user}" if tunnel["status"] == "active" else f"renew_{frp_user}"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=btn_text, callback_data=btn_data)],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="my_tunnels")]
+        ])
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    elif data.startswith("download_"):
+        frp_user = data[9:]
+        config_path = os.path.join(FRP_CONFIG_DIR, f"{frp_user}.toml")
+        if os.path.exists(config_path):
+            with open(config_path, "rb") as f:
+                await callback.message.reply_document(
+                    BufferedInputFile(f.read(), filename=f"{frp_user}.toml"),
+                    caption=f"Конфиг для {frp_user}"
+                )
+        else:
+            await callback.answer("❌ Файл не найден", show_alert=True)
+    elif data.startswith("renew_"):
+        frp_user = data[6:]
+        await callback.message.edit_text(f"🔄 Продление туннеля `{frp_user}`\n\nНапишите администратору @{ADMIN_USERNAME}", parse_mode=ParseMode.MARKDOWN)
+    elif data == "help":
+        text = "❓ *Помощь и инструкция*\n\n1️⃣ Нажми «Купить туннель»\n2️⃣ Выбери тариф\n3️⃣ Выбери способ оплаты\n4️⃣ Введи локальный порт\n5️⃣ Оплати через Platega\n6️⃣ Туннель активируется автоматически\n7️⃣ Скачай конфиг из меню\n\n📞 Поддержка: @" + ADMIN_USERNAME
+        await callback.message.edit_text(text, reply_markup=main_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    elif data == "back":
+        await callback.message.edit_text("✨ Главное меню", reply_markup=main_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    elif data == "back_to_plans":
+        await callback.message.edit_text("💰 Выберите тариф:", reply_markup=plans_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    elif data == "support":
+        await callback.message.edit_text("📩 *Обращение в поддержку*\n\nОпишите вашу проблему или вопрос одним сообщением.\nАдминистратор ответит вам в ближайшее время.", parse_mode=ParseMode.MARKDOWN)
+        user_sessions[callback.message.chat.id] = {"action": "creating_ticket"}
+    elif data.startswith("plan_"):
+        days = int(data.split("_")[1])
+        price = PRICES.get(days)
+        if price:
+            await callback.message.edit_text(f"📦 Выбран тариф: {PLAN_NAMES[days]} — {price} ₽\n\n👇 *Выберите способ оплаты:*", reply_markup=payment_methods_keyboard(days), parse_mode=ParseMode.MARKDOWN)
+        else:
+            await callback.answer("Неверный тариф", show_alert=True)
+    elif data.startswith("pay_"):
+        parts = data.split("_")
+        if len(parts) == 3:
+            days = int(parts[1])
+            payment_method_id = int(parts[2])
+            price = PRICES.get(days)
+            if price:
+                await callback.message.edit_text(f"📦 Тариф: {PLAN_NAMES[days]} — {price} ₽\n💳 Способ оплаты: выбран\n\n✏️ Теперь введите *локальный порт* (число от 1 до 65535):", parse_mode=ParseMode.MARKDOWN)
+                user_sessions[callback.message.chat.id] = {"action": "waiting_port", "days": days, "payment_method": payment_method_id}
+            else:
+                await callback.answer("Неверный тариф", show_alert=True)
+    elif user_id == ADMIN_ID:
+        if data == "admin_panel":
+            await callback.message.edit_text("⚙️ Админ панель", reply_markup=admin_keyboard(), parse_mode=ParseMode.MARKDOWN)
+        elif data == "admin_tunnels":
+            tunnels = get_all_tunnels()
+            if not tunnels:
+                await callback.message.edit_text("📭 Нет туннелей", reply_markup=back_to_admin_keyboard())
+                return
+            text = "📡 *Все туннели:*\n\n"
+            for t in tunnels:
+                left = (t["expires_at"] - datetime.now()).days
+                left_str = f"{left} дн" if left > 0 else "0 дн"
+                status_icon = "🟢" if t["status"] == "active" else "🔴"
+                text += f"{status_icon} `{t['frp_user']}` | @{t['username']} (id:{t['user_id']})\n   🌍 {t['remote_port']} → 🔗 {t['local_port']} | ⏳ {left_str}\n\n"
+            await callback.message.edit_text(text, reply_markup=back_to_admin_keyboard(), parse_mode=ParseMode.MARKDOWN)
+        elif data == "admin_payments_menu":
+            await callback.message.edit_text("💰 *Управление платежами*\nВыберите статус для просмотра:", reply_markup=admin_payments_keyboard(), parse_mode=ParseMode.MARKDOWN)
+        elif data == "admin_payments_pending":
+            payments = get_payments_by_status("PENDING")
+            await show_payments_list(callback, payments, "🟡 Ожидающие платежи")
+        elif data == "admin_payments_confirmed":
+            payments = get_payments_by_status("CONFIRMED")
+            await show_payments_list(callback, payments, "✅ Завершённые платежи")
+        elif data == "admin_payments_failed":
+            payments = get_payments_by_status("FAILED")
+            await show_payments_list(callback, payments, "❌ Отменённые/неудачные платежи")
+        elif data == "admin_payments_all":
+            payments = get_payments_by_status()
+            await show_payments_list(callback, payments, "📋 Все платежи")
+        elif data == "admin_tickets_menu":
+            await callback.message.edit_text("📩 *Управление обращениями*", reply_markup=admin_tickets_keyboard(), parse_mode=ParseMode.MARKDOWN)
+        elif data == "admin_tickets_open":
+            tickets = get_open_tickets()
+            await show_tickets_list(callback, tickets, "open")
+        elif data == "admin_tickets_closed":
+            tickets = get_closed_tickets()
+            await show_tickets_list(callback, tickets, "closed")
+        elif data.startswith("admin_ticket_reply_"):
+            ticket_id = int(data.split("_")[3])
+            admin_temp[callback.message.chat.id] = {"action": "reply_ticket", "ticket_id": ticket_id}
+            await callback.message.edit_text("✏️ Введите текст ответа на обращение (пользователь получит ваше сообщение):")
+        elif data.startswith("admin_ticket_close_"):
+            ticket_id = int(data.split("_")[3])
+            tickets = get_open_tickets()
+            ticket = next((t for t in tickets if t["id"] == ticket_id), None)
+            if ticket:
+                await callback.message.edit_text(f"✏️ Введите ответ для закрытия обращения #{ticket_id} (пользователь получит сообщение):")
+                admin_temp[callback.message.chat.id] = {"action": "close_ticket", "ticket_id": ticket_id}
+            else:
+                await callback.answer("Обращение уже закрыто", show_alert=True)
+        elif data == "admin_create":
+            await callback.message.edit_text("➕ *Создание туннеля*\nВведите в ответ на это сообщение:\n`user_id локальный_порт дни`", parse_mode=ParseMode.MARKDOWN)
+            user_sessions[callback.message.chat.id] = {"action": "admin_create"}
+        elif data == "admin_extend":
+            await callback.message.edit_text("⏫ *Продление туннеля*\nВведите: `frp_user дни`", parse_mode=ParseMode.MARKDOWN)
+            user_sessions[callback.message.chat.id] = {"action": "admin_extend"}
+        elif data == "admin_delete":
+            await callback.message.edit_text("❌ *Удаление туннеля*\nВведите: `frp_user`", parse_mode=ParseMode.MARKDOWN)
+            user_sessions[callback.message.chat.id] = {"action": "admin_delete"}
+        elif data == "admin_msg_user":
+            await callback.message.edit_text("💬 *Написать пользователю*\nВведите ID пользователя и сообщение в формате:\n`user_id текст`\n\nНапример:\n`123456789 Привет, как дела?`")
+            user_sessions[callback.message.chat.id] = {"action": "admin_send_msg"}
+        elif data == "admin_refresh":
+            expired = expire_outdated_tunnels()
+            await callback.message.edit_text(f"🔄 Отключено просроченных: {expired}", reply_markup=admin_keyboard())
+        elif data == "admin_restart_frps":
+            await callback.message.edit_text("🔄 Перезапускаю FRPS...")
+            ok = await restart_frps()
+            await callback.message.edit_text("✅ FRPS перезапущен" if ok else "❌ Ошибка перезапуска", reply_markup=admin_keyboard())
+    else:
+        await callback.answer("Действие недоступно", show_alert=True)
+
+@dp.message()
+async def handle_text(message: Message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    username = message.from_user.username or str(user_id)
+    text = message.text.strip()
+
+    if _is_creator_mark(text):
+        await message.answer(_creator_reply(), parse_mode=None)
+        return
+
+    session = user_sessions.get(chat_id)
+
+    if session and session.get("action") == "creating_ticket":
+        if len(text) < 5:
+            await message.answer("❌ Опишите проблему подробнее (минимум 5 символов).")
+            return
+        ticket_id = create_ticket(user_id, username, text)
+        await message.answer(f"✅ Ваше обращение #{ticket_id} принято. Администратор ответит в ближайшее время.")
+        await message.bot.send_message(ADMIN_ID, f"📩 *Новое обращение #{ticket_id}*\nОт: @{username} (id:{user_id})\n\nСообщение:\n{text}", parse_mode=ParseMode.MARKDOWN)
+        user_sessions.pop(chat_id, None)
+        return
+
+    if session and session.get("action") == "waiting_port":
+        try:
+            local_port = int(text)
+            if not (1 <= local_port <= 65535):
+                raise ValueError
+        except:
+            await message.answer("❌ Введите корректный номер порта (1-65535)")
+            return
+        days = session["days"]
+        payment_method = session.get("payment_method", PLATEGA_DEFAULT_METHOD)
+        amount = PRICES.get(days)
+        if not amount:
+            await message.answer("Ошибка: тариф не найден")
+            return
+        description = f"Туннель на {days} дней, порт {local_port}"
+        payload = f"user_{user_id}_{int(time.time()*1000)}"
+        payment = await create_platega_payment(amount, description, payload, payment_method)
+        if not payment or "transactionId" not in payment:
+            await message.answer("❌ Ошибка создания платежа. Попробуйте позже.")
+            return
+        payment_id = payment["transactionId"]
+        redirect_url = payment.get("redirect")
+        save_pending_payment(payment_id, user_id, username, amount, days, local_port, payment_method)
+        await message.answer(
+            f"💳 *Счёт на оплату*\nСумма: {amount:.2f} RUB\nСпособ: {payment_method_name(payment_method)}\n\n[Оплатить по ссылке]({redirect_url})\n\nПосле оплаты туннель активируется автоматически в течение минуты.",
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True
+        )
+        user_sessions.pop(chat_id, None)
+        return
+
+    if user_id == ADMIN_ID:
+        if session and session.get("action") == "admin_send_msg":
+            parts = text.split(" ", 1)
+            if len(parts) < 2:
+                await message.answer("❌ Формат: `user_id текст`")
+                return
+            try:
+                target_id = int(parts[0])
+                msg_text = parts[1]
+                await message.bot.send_message(target_id, f"✉️ *Сообщение от администратора:*\n{msg_text}", parse_mode=ParseMode.MARKDOWN)
+                await message.answer(f"✅ Сообщение отправлено пользователю {target_id}")
+            except Exception as e:
+                await message.answer(f"❌ Ошибка: {e}")
+            user_sessions.pop(chat_id, None)
+            return
+
+        if session and session.get("action") == "reply_ticket":
+            ticket_id = session["ticket_id"]
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT user_id, username FROM tickets WHERE id = ?", (ticket_id,))
+            row = c.fetchone()
+            conn.close()
+            if not row:
+                await message.answer("❌ Обращение не найдено")
+                user_sessions.pop(chat_id, None)
+                return
+            target_user_id, target_username = row
+            await message.bot.send_message(target_user_id, f"📩 *Ответ на ваше обращение #{ticket_id}*\n\n{text}", parse_mode=ParseMode.MARKDOWN)
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("UPDATE tickets SET reply = ? WHERE id = ?", (text, ticket_id))
+            conn.commit()
+            conn.close()
+            await message.answer(f"✅ Ответ отправлен пользователю @{target_username}. Обращение остаётся открытым. Чтобы закрыть, используйте кнопку 'Закрыть'.")
+            user_sessions.pop(chat_id, None)
+            return
+
+        if session and session.get("action") == "close_ticket":
+            ticket_id = session["ticket_id"]
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT user_id, username FROM tickets WHERE id = ?", (ticket_id,))
+            row = c.fetchone()
+            if row:
+                target_user_id, target_username = row
+                await message.bot.send_message(target_user_id, f"✅ *Обращение #{ticket_id} закрыто*\n\nОтвет администратора:\n{text}", parse_mode=ParseMode.MARKDOWN)
+                close_ticket(ticket_id, text)
+                await message.answer(f"✅ Обращение #{ticket_id} закрыто, ответ отправлен пользователю @{target_username}.")
+            else:
+                await message.answer("❌ Обращение не найдено")
+            user_sessions.pop(chat_id, None)
+            return
+
+        if session and session.get("action") == "admin_create":
+            parts = text.split()
+            if len(parts) != 3:
+                await message.answer("❌ Формат: user_id порт дни")
+                return
+            try:
+                uid = int(parts[0])
+                lp = int(parts[1])
+                days = int(parts[2])
+                uname = f"user_{uid}"
+                frp_user, token, rp = await create_frp_user(uid, uname, lp, days)
+                await message.answer(f"✅ Туннель создан:\nFRP User: {frp_user}\nПубличный порт: {rp}")
+            except Exception as e:
+                await message.answer(f"❌ Ошибка: {e}")
+            user_sessions.pop(chat_id, None)
+            return
+
+        if session and session.get("action") == "admin_extend":
+            parts = text.split()
+            if len(parts) != 2:
+                await message.answer("❌ Формат: frp_user дни")
+                return
+            frp_user = parts[0]
+            extra = int(parts[1])
+            new_exp = await extend_frp_user(frp_user, extra)
+            if new_exp:
+                await message.answer(f"✅ Туннель продлён до {new_exp.strftime('%Y-%m-%d %H:%M:%S')}")
+            else:
+                await message.answer("❌ Туннель не найден")
+            user_sessions.pop(chat_id, None)
+            return
+
+        if session and session.get("action") == "admin_delete":
+            frp_user = text
+            await delete_frp_user(frp_user)
+            await message.answer(f"✅ Туннель {frp_user} удалён")
+            user_sessions.pop(chat_id, None)
+            return
+
+    await message.answer("Используйте кнопки меню.", reply_markup=main_keyboard())
+
+# ========== ЗАПУСК ==========
+async def main():
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+    asyncio.create_task(payment_checker_loop(bot))
+    asyncio.create_task(expiry_checker(bot))
+    print("entering polling")
+    await dp.start_polling(bot)
+    print("exited polling")
+
+if __name__ == "__main__":
+    asyncio.run(main())
